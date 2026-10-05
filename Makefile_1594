@@ -10,4 +10,4 @@ client_1594: client_1594.c
 	$(CC) $(CFLAGS) -o client_1594 client_1594.c
 
 clean:
-    rm -f server_1594 client_1594
+	rm -f server_1594 client_1594
