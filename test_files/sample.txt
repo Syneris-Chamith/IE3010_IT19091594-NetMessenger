@@ -1,0 +1,6 @@
+The aim of this unit is to provide in-depth knowledge in network
+programming. It has touched a wide range of networking protocols
+such as TCP/ UDP, HTTP/HTTPS, web socket and so forth. The
+operation and characteristics of major computer networks are studied
+because of their strong influence on programming interfaces (APIs)
+and application design.

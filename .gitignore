@@ -1,0 +1,13 @@
+# Compiled binaries
+server_1594
+client_1594
+*.o
+
+# Runtime data
+storage/
+downloads/
+netmsg_IT19091594.log
+
+# Editor files
+*.swp
+.vscode/
