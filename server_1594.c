@@ -15,7 +15,8 @@
  *   - Personalised: port 7594, NID:0915 on every OK/ERR reply, log file
  *                   netmsg_IT19091594.log, files stored under
  *                   ./storage/IT19091594/<sender_username>/<filename>
- *   - Extension   : per-client rate limiting (flood protection).
+ *   - Extensions  : optional token authentication, persistent chat history,
+ *                   UDP presence heartbeats, and per-client rate limiting.
  *
  * Build : make -f Makefile_1594
  * Run   : ./server_1594
@@ -44,9 +45,11 @@
 /* ================================================================== */
 #define REG_NO        "IT19091594"
 #define PORT          7594                    /* 6000 + 1594            */
+#define PRESENCE_PORT (PORT + 1)
 #define NID_TAG       "NID:0915"              /* digits 3-6 of 19091594 */
 #define LOG_FILE      "netmsg_IT19091594.log"
 #define STORAGE_ROOT  "./storage"             /* + /IT19091594/<user>/  */
+#define HISTORY_ROOT  "./storage/IT19091594/history"
 
 /* ================================================================== */
 /* Limits                                                              */
@@ -72,6 +75,7 @@ typedef struct {
     int  fd;                        /* socket, -1 when slot is free     */
     int  active;                    /* slot in use                      */
     int  registered;                /* REGISTER done                    */
+    int  authenticated;             /* AUTH done when token is enabled  */
     char username[NAME_LEN];
     char addr[48];                  /* "ip:port", used in the log       */
     pthread_mutex_t send_lock;      /* one writer per socket at a time  */
@@ -79,6 +83,7 @@ typedef struct {
     size_t inlen;
     long   rate_window_start;       /* rate limiting bookkeeping        */
     int    rate_count;
+    long   last_heartbeat;
 } Client;
 
 typedef struct {
@@ -93,7 +98,10 @@ static Room   rooms[MAX_ROOMS];
 /* clients_lock protects clients[] (except each send_lock) AND rooms[]. */
 static pthread_mutex_t clients_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t log_lock     = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t history_lock = PTHREAD_MUTEX_INITIALIZER;
 static volatile sig_atomic_t g_running = 1;
+static const char *auth_token;
+static int udp_sock = -1;
 
 /*
  * Lock order (to avoid deadlock): clients_lock first, then a client's
@@ -110,6 +118,8 @@ typedef enum {
 /* Logging                                                             */
 /* ================================================================== */
 static void log_event(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+static void history_append(const char *user, const char *message);
+static void history_replay(Client *c);
 
 static void log_event(const char *fmt, ...)
 {
@@ -417,6 +427,36 @@ static void cmd_register(Client *c, const char *args)
     log_event("REGISTER %s from %s", c->username, c->addr);
     /* presence notification: our own format, documented in the report */
     broadcast_except(c, "MSG JOIN %s", c->username);
+    history_replay(c);
+}
+
+static int token_matches(const char *provided)
+{
+    size_t expected_len = strlen(auth_token);
+    size_t provided_len = strlen(provided);
+    size_t diff = expected_len ^ provided_len;
+    size_t compare_len = expected_len > provided_len ? expected_len : provided_len;
+    for (size_t i = 0; i < compare_len; i++) {
+        unsigned char a = i < expected_len ? (unsigned char)auth_token[i] : 0;
+        unsigned char b = i < provided_len ? (unsigned char)provided[i] : 0;
+        diff |= (size_t)(a ^ b);
+    }
+    return diff == 0;
+}
+
+static void cmd_auth(Client *c, const char *provided)
+{
+    if (!auth_token || !auth_token[0]) {
+        send_response(c, "ERR 018 AUTH_NOT_CONFIGURED");
+        return;
+    }
+    if (!provided[0] || !token_matches(provided)) {
+        send_response(c, "ERR 019 AUTH_FAILED");
+        log_event("AUTH failed from %s", c->addr);
+        return;
+    }
+    c->authenticated = 1;
+    send_response(c, "OK AUTHENTICATED");
 }
 
 static void cmd_list(Client *c)
@@ -445,7 +485,18 @@ static void cmd_bcast(Client *c, const char *msg)
         send_response(c, "ERR 006 BAD_SYNTAX");
         return;
     }
-    broadcast_except(c, "MSG BCAST %s %s", c->username, msg);
+    char history_line[RESP_SIZE];
+    snprintf(history_line, sizeof history_line, "MSG BCAST %s %s", c->username, msg);
+    history_append(c->username, history_line);
+    pthread_mutex_lock(&clients_lock);
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        Client *o = &clients[i];
+        if (o->active && o->registered && o != c) {
+            history_append(o->username, history_line);
+            send_line(o, "%s", history_line);
+        }
+    }
+    pthread_mutex_unlock(&clients_lock);
     send_response(c, "OK SENT");
     log_event("BCAST from %s (%zu bytes)", c->username, strlen(msg));
 }
@@ -463,7 +514,11 @@ static void cmd_pmsg(Client *c, char *args)
     pthread_mutex_lock(&clients_lock);
     Client *t = find_user_locked(target);
     if (t) {
-        send_line(t, "MSG PRIV %s %s", c->username, msg);
+        char history_line[RESP_SIZE];
+        snprintf(history_line, sizeof history_line, "MSG PRIV %s %s", c->username, msg);
+        history_append(c->username, history_line);
+        history_append(t->username, history_line);
+        send_line(t, "%s", history_line);
         found = 1;
     }
     pthread_mutex_unlock(&clients_lock);
@@ -585,10 +640,16 @@ static void cmd_rmsg(Client *c, char *args)
     } else if (!rooms[r].member[client_index(c)]) {
         err = "ERR 012 NOT_A_MEMBER";
     } else {
+        char history_line[RESP_SIZE];
+        snprintf(history_line, sizeof history_line, "MSG ROOM %s %s %s",
+                 room, c->username, msg);
+        history_append(c->username, history_line);
         for (int i = 0; i < MAX_CLIENTS; i++) {
             if (rooms[r].member[i] && clients[i].active &&
-                clients[i].registered && &clients[i] != c)
-                send_line(&clients[i], "MSG ROOM %s %s %s", room, c->username, msg);
+                clients[i].registered && &clients[i] != c) {
+                history_append(clients[i].username, history_line);
+                send_line(&clients[i], "%s", history_line);
+            }
         }
     }
     pthread_mutex_unlock(&clients_lock);
@@ -643,6 +704,69 @@ static int ensure_dir(const char *path)
 {
     if (mkdir(path, 0755) == 0 || errno == EEXIST) return 0;
     return -1;
+}
+
+static void history_append(const char *user, const char *message)
+{
+    char path[512];
+    if (ensure_dir(STORAGE_ROOT) < 0 ||
+        ensure_dir("./storage/IT19091594") < 0 ||
+        ensure_dir(HISTORY_ROOT) < 0) {
+        log_event("CHAT HISTORY storage unavailable for %s: %s", user, strerror(errno));
+        return;
+    }
+    int n = snprintf(path, sizeof path, "%s/%s.log", HISTORY_ROOT, user);
+    if (n < 0 || (size_t)n >= sizeof path) {
+        log_event("CHAT HISTORY path too long for %s", user);
+        return;
+    }
+
+    pthread_mutex_lock(&history_lock);
+    FILE *f = fopen(path, "a");
+    if (!f) {
+        int err = errno;
+        pthread_mutex_unlock(&history_lock);
+        log_event("CHAT HISTORY cannot open %s: %s", path, strerror(err));
+        return;
+    }
+    int failed = fprintf(f, "%lld\t%s\n", (long long)time(NULL), message) < 0;
+    if (fclose(f) != 0) failed = 1;
+    pthread_mutex_unlock(&history_lock);
+    if (failed) log_event("CHAT HISTORY write failed for %s", user);
+}
+
+static void history_replay(Client *c)
+{
+    char path[512];
+    int n = snprintf(path, sizeof path, "%s/%s.log", HISTORY_ROOT, c->username);
+    if (n < 0 || (size_t)n >= sizeof path) {
+        log_event("CHAT HISTORY path too long for %s", c->username);
+        return;
+    }
+
+    pthread_mutex_lock(&history_lock);
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        if (errno != ENOENT)
+            log_event("CHAT HISTORY cannot read %s: %s", path, strerror(errno));
+        pthread_mutex_unlock(&history_lock);
+        return;
+    }
+
+    char row[RESP_SIZE + 64];
+    while (fgets(row, sizeof row, f)) {
+        char *separator = strchr(row, '\t');
+        if (!separator) {
+            log_event("CHAT HISTORY malformed entry for %s", c->username);
+            continue;
+        }
+        *separator++ = '\0';
+        separator[strcspn(separator, "\r\n")] = '\0';
+        send_line(c, "MSG HISTORY %s %s", row, separator);
+    }
+    if (ferror(f)) log_event("CHAT HISTORY read failed for %s", c->username);
+    fclose(f);
+    pthread_mutex_unlock(&history_lock);
 }
 
 /* Create ./storage/IT19091594/<user>/ ; the path is returned in 'out'. */
@@ -833,6 +957,15 @@ static CmdResult handle_command(Client *c, char *line)
         return CMD_CONTINUE;
     }
 
+    if (strcmp(line, "AUTH") == 0) {
+        cmd_auth(c, args);
+        return CMD_CONTINUE;
+    }
+    if (!c->authenticated) {
+        send_response(c, "ERR 020 AUTH_REQUIRED");
+        return CMD_CONTINUE;
+    }
+
     if (strcmp(line, "REGISTER") == 0) {
         cmd_register(c, args);
         return CMD_CONTINUE;
@@ -961,6 +1094,48 @@ static void on_signal(int sig)
     g_running = 0;                  /* accept() returns EINTR, loop ends */
 }
 
+static void *heartbeat_thread(void *arg)
+{
+    (void)arg;
+    char packet[128];
+    while (g_running) {
+        struct sockaddr_in peer;
+        socklen_t peer_len = sizeof peer;
+        ssize_t n = recvfrom(udp_sock, packet, sizeof packet - 1, 0,
+                             (struct sockaddr *)&peer, &peer_len);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            if (!g_running || errno == EBADF || errno == EINVAL) break;
+            perror("presence recvfrom");
+            continue;
+        }
+        packet[n] = '\0';
+
+        char name[NAME_LEN], extra;
+        if (sscanf(packet, "HEARTBEAT %31s %c", name, &extra) != 1 ||
+            !valid_name(name))
+            continue;
+
+        char ip[INET_ADDRSTRLEN];
+        if (!inet_ntop(AF_INET, &peer.sin_addr, ip, sizeof ip)) continue;
+        int announce = 0;
+        pthread_mutex_lock(&clients_lock);
+        Client *c = find_user_locked(name);
+        if (c) {
+            size_t ip_len = strlen(ip);
+            if (strncmp(c->addr, ip, ip_len) == 0 && c->addr[ip_len] == ':') {
+                long now = mono_seconds();
+                announce = c->last_heartbeat == 0 ||
+                           now - c->last_heartbeat >= 30;
+                c->last_heartbeat = now;
+            }
+        }
+        pthread_mutex_unlock(&clients_lock);
+        if (announce) log_event("PRESENCE heartbeat from %s (%s)", name, ip);
+    }
+    return NULL;
+}
+
 int main(void)
 {
     /* Writing to a dead socket must not kill the whole server. */
@@ -975,6 +1150,12 @@ int main(void)
     for (int i = 0; i < MAX_CLIENTS; i++) {
         clients[i].fd = -1;
         pthread_mutex_init(&clients[i].send_lock, NULL);
+    }
+
+    auth_token = getenv("NETMSG_TOKEN");
+    if (auth_token && strlen(auth_token) > 256) {
+        fprintf(stderr, "NETMSG_TOKEN must be no longer than 256 characters\n");
+        return 1;
     }
 
     int srv = socket(AF_INET, SOCK_STREAM, 0);
@@ -998,7 +1179,32 @@ int main(void)
         return 1;
     }
 
-    log_event("Server started for %s: listening on port %d (%s)", REG_NO, PORT, NID_TAG);
+    udp_sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (udp_sock < 0) {
+        perror("presence socket");
+        close(srv);
+        return 1;
+    }
+    struct sockaddr_in udp_addr = addr;
+    udp_addr.sin_port = htons(PRESENCE_PORT);
+    if (bind(udp_sock, (struct sockaddr *)&udp_addr, sizeof udp_addr) < 0) {
+        perror("presence bind");
+        close(udp_sock);
+        close(srv);
+        return 1;
+    }
+    pthread_t heartbeat_tid;
+    if (pthread_create(&heartbeat_tid, NULL, heartbeat_thread, NULL) != 0) {
+        fprintf(stderr, "could not start presence heartbeat thread\n");
+        close(udp_sock);
+        close(srv);
+        return 1;
+    }
+    pthread_detach(heartbeat_tid);
+
+    log_event("Server started for %s: listening on TCP port %d and UDP presence port %d (%s)%s",
+              REG_NO, PORT, PRESENCE_PORT, NID_TAG,
+              auth_token && auth_token[0] ? " (token authentication enabled)" : "");
 
     while (g_running) {
         struct sockaddr_in caddr;
@@ -1026,10 +1232,12 @@ int main(void)
             c->fd = fd;
             c->active = 1;
             c->registered = 0;
+            c->authenticated = !auth_token || !auth_token[0];
             c->username[0] = '\0';
             c->inlen = 0;
             c->rate_window_start = mono_seconds();
             c->rate_count = 0;
+            c->last_heartbeat = 0;
             snprintf(c->addr, sizeof c->addr, "%s:%d", ip, ntohs(caddr.sin_port));
         }
         pthread_mutex_unlock(&clients_lock);
@@ -1054,6 +1262,7 @@ int main(void)
     }
 
     log_event("Server shutting down");
+    close(udp_sock);
     close(srv);
     return 0;
 }

@@ -9,6 +9,7 @@
  *
  * What it does
  *   - connects to the server (port 7594 = 6000 + 1594) and sends REGISTER
+ *   - optionally authenticates with NETMSG_TOKEN and sends UDP heartbeats
  *   - uses select() to watch the keyboard AND the socket at the same time,
  *     so messages from other users appear while you are typing
  *   - you type the protocol commands directly (type HELP to list them)
@@ -31,9 +32,11 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
 
 #define SERVER_PORT   7594            /* 6000 + 1594 (IT19091594)        */
+#define PRESENCE_PORT (SERVER_PORT + 1)
 #define DEFAULT_IP    "127.0.0.1"
 #define INPUT_SIZE    2048            /* longest line the user can type  */
 #define RBUF_SIZE     8192            /* bytes received from the server  */
@@ -309,6 +312,7 @@ int main(int argc, char **argv)
         return 1;
     }
     const char *ip = (argc > 2) ? argv[2] : DEFAULT_IP;
+    const char *token = getenv("NETMSG_TOKEN");
 
     sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock < 0) { perror("socket"); return 1; }
@@ -330,14 +334,43 @@ int main(int argc, char **argv)
     printf("Connected to %s:%d as '%s'. Type HELP for commands.\n", ip, SERVER_PORT, myname);
     fflush(stdout);
 
+    int udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (udp_fd >= 0) {
+        struct sockaddr_in presence = srv;
+        presence.sin_port = htons(PRESENCE_PORT);
+        if (connect(udp_fd, (struct sockaddr *)&presence, sizeof presence) < 0) {
+            perror("presence connect");
+            close(udp_fd);
+            udp_fd = -1;
+        }
+    } else {
+        perror("presence socket");
+    }
+
+    if (token && token[0]) {
+        char auth[320];
+        snprintf(auth, sizeof auth, "AUTH %s", token);
+        if (send_line(auth) < 0) {
+            printf("[client] authentication send failed\n");
+            if (udp_fd >= 0) close(udp_fd);
+            close(sock);
+            return 1;
+        }
+    }
     char reg[128];
     snprintf(reg, sizeof reg, "REGISTER %s", myname);
-    if (send_line(reg) < 0) { printf("[client] send failed\n"); return 1; }
+    if (send_line(reg) < 0) {
+        printf("[client] send failed\n");
+        if (udp_fd >= 0) close(udp_fd);
+        close(sock);
+        return 1;
+    }
 
     char   ibuf[INPUT_SIZE];
     size_t ilen = 0;
     int    stdin_open = 1;
     int    lost = 0;
+    time_t last_heartbeat = 0;
 
     while (!lost) {
         fd_set rf;
@@ -345,10 +378,22 @@ int main(int argc, char **argv)
         FD_SET(sock, &rf);
         if (stdin_open) FD_SET(STDIN_FILENO, &rf);
 
-        if (select(sock + 1, &rf, NULL, NULL, NULL) < 0) {
+        struct timeval timeout = { 5, 0 };
+        if (select(sock + 1, &rf, NULL, NULL, &timeout) < 0) {
             if (errno == EINTR) continue;
             perror("select");
             break;
+        }
+
+        time_t now = time(NULL);
+        if (udp_fd >= 0 && (last_heartbeat == 0 || now - last_heartbeat >= 5)) {
+            char heartbeat[96];
+            int len = snprintf(heartbeat, sizeof heartbeat, "HEARTBEAT %s", myname);
+            if (len > 0 && (size_t)len < sizeof heartbeat &&
+                send(udp_fd, heartbeat, (size_t)len, MSG_NOSIGNAL) < 0 &&
+                errno != EINTR)
+                perror("presence heartbeat");
+            last_heartbeat = now;
         }
 
         /* ---- something arrived from the server ---- */
@@ -418,6 +463,7 @@ int main(int argc, char **argv)
         }
     }
 
+    if (udp_fd >= 0) close(udp_fd);
     close(sock);
     return 0;
 }
